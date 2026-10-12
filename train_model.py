@@ -1,21 +1,63 @@
-
+import json
+import os
 import tensorflow as tf
-from pathlib import Path
 
-# Dataset folder
-DATA_DIR = Path(r"C:\AgroAI\dataset\raw\color")
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import MobileNetV2
 
-# Model settings
-IMAGE_SIZE = (128, 128)
+
+# -----------------------------
+# PROJECT CONFIGURATION
+# -----------------------------
+
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
+
+DATASET_DIR = os.path.join(
+    PROJECT_DIR,
+    "dataset"
+)
+
+MODEL_DIR = os.path.join(
+    PROJECT_DIR,
+    "ml"
+)
+
+MODEL_PATH = os.path.join(
+    MODEL_DIR,
+    "disease_model.keras"
+)
+
+CLASS_NAMES_PATH = os.path.join(
+    MODEL_DIR,
+    "class_names.json"
+)
+
+IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
 SEED = 42
+EPOCHS = 10
 
-print("TensorFlow version:", tf.__version__)
-print("Loading plant disease images...")
 
-# Load images and create training/validation datasets
-train_ds = tf.keras.utils.image_dataset_from_directory(
-    DATA_DIR,
+# -----------------------------
+# CHECK DATASET
+# -----------------------------
+
+if not os.path.isdir(DATASET_DIR):
+    raise FileNotFoundError(
+        f"Dataset folder not found: {DATASET_DIR}"
+    )
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+# -----------------------------
+# LOAD TRAINING DATA
+# -----------------------------
+
+train_dataset = tf.keras.utils.image_dataset_from_directory(
+    DATASET_DIR,
     validation_split=0.2,
     subset="training",
     seed=SEED,
@@ -24,8 +66,8 @@ train_ds = tf.keras.utils.image_dataset_from_directory(
     label_mode="int"
 )
 
-val_ds = tf.keras.utils.image_dataset_from_directory(
-    DATA_DIR,
+validation_dataset = tf.keras.utils.image_dataset_from_directory(
+    DATASET_DIR,
     validation_split=0.2,
     subset="validation",
     seed=SEED,
@@ -34,60 +76,165 @@ val_ds = tf.keras.utils.image_dataset_from_directory(
     label_mode="int"
 )
 
-class_names = train_ds.class_names
 
-print("\nTotal classes:", len(class_names))
-print("Training batches:", tf.data.experimental.cardinality(train_ds).numpy())
-print("Validation batches:", tf.data.experimental.cardinality(val_ds).numpy())
+# -----------------------------
+# SAVE CLASS NAMES
+# -----------------------------
 
-# Save class names for the Django backend
-Path(r"C:\AgroAI\backend").mkdir(parents=True, exist_ok=True)
+class_names = train_dataset.class_names
 
-with open(r"C:\AgroAI\backend\classes.txt", "w", encoding="utf-8") as file:
-    file.write("\n".join(class_names))
+print("\nClasses found:")
 
-print("\nClass names saved to C:\\AgroAI\\backend\\classes.txt")
+for index, name in enumerate(class_names):
+    print(index, ":", name)
 
-# Improve input performance
+if len(class_names) < 2:
+    raise ValueError(
+        "At least two class folders are required."
+    )
+
+with open(
+    CLASS_NAMES_PATH,
+    "w",
+    encoding="utf-8"
+) as file:
+    json.dump(
+        class_names,
+        file,
+        indent=4
+    )
+
+
+# -----------------------------
+# IMPROVE INPUT PERFORMANCE
+# -----------------------------
+
 AUTOTUNE = tf.data.AUTOTUNE
-train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
-val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
 
-# Create a basic CNN model
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(128, 128, 3)),
-    tf.keras.layers.Rescaling(1.0 / 255),
-    tf.keras.layers.Conv2D(32, 3, activation="relu"),
-    tf.keras.layers.MaxPooling2D(),
-    tf.keras.layers.Conv2D(64, 3, activation="relu"),
-    tf.keras.layers.MaxPooling2D(),
-    tf.keras.layers.Conv2D(128, 3, activation="relu"),
-    tf.keras.layers.MaxPooling2D(),
-    tf.keras.layers.Flatten(),
-    tf.keras.layers.Dense(128, activation="relu"),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(len(class_names), activation="softmax")
+train_dataset = train_dataset.prefetch(
+    buffer_size=AUTOTUNE
+)
+
+validation_dataset = validation_dataset.prefetch(
+    buffer_size=AUTOTUNE
+)
+
+
+# -----------------------------
+# DATA AUGMENTATION
+# -----------------------------
+
+data_augmentation = models.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+    layers.RandomZoom(0.1),
 ])
 
+
+# -----------------------------
+# LOAD PRETRAINED MOBILENETV2
+# -----------------------------
+
+base_model = MobileNetV2(
+    input_shape=(224, 224, 3),
+    include_top=False,
+    weights="imagenet"
+)
+
+# Initially freeze the pretrained layers.
+base_model.trainable = False
+
+
+# -----------------------------
+# BUILD CLASSIFICATION MODEL
+# -----------------------------
+
+inputs = layers.Input(
+    shape=(224, 224, 3)
+)
+
+x = data_augmentation(inputs)
+
+# MobileNetV2 expects pixels scaled to [-1, 1].
+x = layers.Rescaling(
+    scale=1.0 / 127.5,
+    offset=-1
+)(x)
+
+x = base_model(
+    x,
+    training=False
+)
+
+x = layers.GlobalAveragePooling2D()(x)
+
+x = layers.Dropout(0.2)(x)
+
+outputs = layers.Dense(
+    len(class_names),
+    activation="softmax"
+)(x)
+
+model = models.Model(
+    inputs,
+    outputs
+)
+
+
+# -----------------------------
+# COMPILE MODEL
+# -----------------------------
+
 model.compile(
-    optimizer="adam",
+    optimizer=tf.keras.optimizers.Adam(
+        learning_rate=0.001
+    ),
     loss="sparse_categorical_crossentropy",
     metrics=["accuracy"]
 )
 
-model.summary()
 
-print("\nStarting model training...")
+# -----------------------------
+# TRAIN MODEL
+# -----------------------------
 
-model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=5
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=3,
+        restore_best_weights=True
+    )
+]
+
+history = model.fit(
+    train_dataset,
+    validation_data=validation_dataset,
+    epochs=EPOCHS,
+    callbacks=callbacks
 )
 
-# Save trained model
-MODEL_PATH = r"C:\AgroAI\backend\plant_disease_model.keras"
+
+# -----------------------------
+# SAVE MODEL
+# -----------------------------
+
 model.save(MODEL_PATH)
 
-print("\nTraining completed!")
+print("\nTraining completed.")
+
 print("Model saved to:", MODEL_PATH)
+
+print(
+    "Class names saved to:",
+    CLASS_NAMES_PATH
+)
+
+print(
+    "Final training accuracy:",
+    history.history["accuracy"][-1]
+)
+
+print(
+    "Final validation accuracy:",
+    history.history["val_accuracy"][-1]
+)
